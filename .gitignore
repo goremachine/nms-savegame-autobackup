@@ -1,0 +1,5 @@
+test-destinationfolder/
+test-sourcefolder/
+.venv/
+.vscode/
+config.json
