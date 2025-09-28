@@ -136,8 +136,8 @@ class BackupEventHandler(FileSystemEventHandler):
                 except ValueError:
                     pass # Should not happen with filter
             else: # No number in filename (e.g., 'save.hg')
-                log_message = "Restore Point change detected"
-                change_type = "Restore Point"
+                log_message = "Autosave change detected"
+                change_type = "Autosave"
 
         self.change_types.add(change_type)
         # Check the debug setting from the app instance to allow runtime changes
