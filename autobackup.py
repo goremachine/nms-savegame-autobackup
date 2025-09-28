@@ -20,11 +20,19 @@ if sys.platform == "win32":
 import sv_ttk
 from watchdog.events import FileSystemEventHandler
 
+# --- Custom Formatter for logging ---
+class CustomFormatter(logging.Formatter):
+    """A custom formatter that allows for timestamp-free messages."""
+    def format(self, record):
+        if hasattr(record, 'plain') and record.plain:
+            return record.getMessage()
+        return super().format(record)
+
 # --- Basic Setup ---
 # Configure logging to provide clear feedback to the console.
 logging.basicConfig(
     level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
+    format='%(message)s', # Format is now handled by the custom formatter
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
@@ -100,8 +108,8 @@ class BackupEventHandler(FileSystemEventHandler):
     def __init__(self, config, app_instance):
         self.config = config
         self.timer = None
-        self.change_types = set()
         self.change_detected_in_batch = False
+        self.changed_events = [] # Store (event_type, src_path) tuples
         # Time to wait in seconds after the last detected change before starting a backup
         self.DEBOUNCE_SECONDS = 5.0
 
@@ -117,35 +125,12 @@ class BackupEventHandler(FileSystemEventHandler):
             if 'cache' in path_parts:
                 return # Ignore event inside a cache folder
 
-        # --- Custom log message based on filename ---
-        change_type = "Other"
-        log_message = None
-        if not event.is_directory and event.src_path.lower().endswith('.hg'):
-            filename = os.path.basename(event.src_path).lower()
-            # Extract numbers from the filename
-            numbers_in_filename = ''.join(filter(str.isdigit, filename))
-            if numbers_in_filename:
-                try:
-                    save_number = int(numbers_in_filename)
-                    if save_number % 2 == 0: # Even number
-                        log_message = "Restore Point change detected"
-                        change_type = "Restore Point"
-                    else: # Odd number
-                        log_message = "Autosave change detected"
-                        change_type = "Autosave"
-                except ValueError:
-                    pass # Should not happen with filter
-            else: # No number in filename (e.g., 'save.hg')
-                log_message = "Autosave change detected"
-                change_type = "Autosave"
+        if not event.is_directory: # We only care about file changes
+            self.changed_events.append((event.event_type, event.src_path))
 
-        self.change_types.add(change_type)
         # Check the debug setting from the app instance to allow runtime changes
         if self.config.get('debug_output', False):
-            if log_message:
-                logging.info(f"Change detected: {log_message} in '{os.path.basename(event.src_path)}'. Resetting timer.")
-            else:
-                logging.info(f"Change detected: {event.event_type} at {event.src_path}. Resetting timer.")
+            logging.info(f"Change detected: {event.event_type} at {event.src_path}. Resetting timer.")
         self.change_detected_in_batch = True
 
         # If a timer is already running, cancel it to reset the waiting period
@@ -179,33 +164,81 @@ class BackupEventHandler(FileSystemEventHandler):
             logging.info("⚠️ Change detected. Preparing backup...")
         self.change_detected_in_batch = False # Reset for next batch
 
-        # Determine the overall backup type based on the collected change types
+        # --- Overhauled Classification Logic ---
         backup_type = "Other Backup"
         backup_suffix = "Other"
-        if self.change_types:
-            # Determine the most significant change type detected
-            if "Restore Point" in self.change_types:
-                backup_type = "Restore Point Backup"
-                backup_suffix = "RestorePoint"
-            elif "Autosave" in self.change_types:
-                backup_type = "Autosave Backup"
-                backup_suffix = "AutoSave"
+        always_backup = False
 
-        self.change_types.clear() # Reset for the next cycle
+        # Rule 1: Check for true deletions. A file overwrite often involves a delete followed by a rename.
+        # We only classify as "Undelete" if a deleted file does not exist at the end of the debounce period.
+        deleted_paths = [path for event_type, path in self.changed_events if event_type == 'deleted']
+        is_true_deletion = any(not os.path.exists(path) for path in deleted_paths)
+
+        if is_true_deletion:
+            backup_type = "Undelete Backup"
+            backup_suffix = "Undelete"
+            always_backup = True
+        else:
+            # Analyze all changed .hg files
+            hg_files = [path for _, path in self.changed_events if path.lower().endswith('.hg')]
+            save_hg_files = [path for path in hg_files if "save" in os.path.basename(path).lower()]
+
+            if not hg_files:
+                # No .hg files changed, must be "Other"
+                pass # Defaults are already "Other"
+            elif not save_hg_files:
+                # Rule 2: .hg files exist, but none are "save" files.
+                pass # Defaults are already "Other"
+            else:
+                # At least one "save.hg" file was changed. Now analyze them.
+                has_even = False
+                has_odd_or_none = False
+
+                for path in save_hg_files:
+                    filename = os.path.basename(path).lower()
+                    numbers = ''.join(filter(str.isdigit, filename))
+                    if not numbers:
+                        has_odd_or_none = True
+                    else:
+                        try:
+                            if int(numbers) % 2 == 0:
+                                has_even = True
+                            else:
+                                has_odd_or_none = True
+                        except ValueError:
+                            pass # Should not happen
+
+                # Rule 5: A mix of save types.
+                if has_even and has_odd_or_none:
+                    backup_type = "General Savegame Backup"
+                    backup_suffix = "General"
+                    always_backup = True
+                # Rule 3: Only even-numbered saves.
+                elif has_even and not has_odd_or_none:
+                    backup_type = "Restore Point Backup"
+                    backup_suffix = "RestorePoint"
+                # Rule 4: Only odd or no-number saves.
+                elif has_odd_or_none and not has_even:
+                    backup_type = "Autosave Backup"
+                    backup_suffix = "AutoSave"
+
+        self.changed_events.clear() # Reset for the next cycle
 
         # Check configuration to see if this type of backup is enabled
-        if backup_suffix == "RestorePoint" and not self.config.get("backup_restore_points", True):
+        if always_backup:
+            pass # This backup type must always run.
+        elif backup_suffix == "RestorePoint" and not self.config.get("backup_restore_points", True):
             logging.info("🚫 Restore Point backup is disabled in settings. Skipping.")
             return
-        if backup_suffix == "AutoSave" and not self.config.get("backup_autosaves", True):
+        elif backup_suffix == "AutoSave" and not self.config.get("backup_autosaves", True):
             logging.info("🚫 Autosave backup is disabled in settings. Skipping.")
             return
-        if backup_suffix == "Other" and not self.config.get("backup_other", True):
+        elif backup_suffix == "Other" and not self.config.get("backup_other", True):
             logging.info("🚫 'Other' file change backup is disabled in settings. Skipping.")
             return
 
         if self.config.get('debug_output', False):
-            logging.info("--- Inactivity detected. Proceeding with backup. ---")
+            logging.info("Inactivity detected. Proceeding with backup...")
 
         # Check if source folder still exists before creating backup
         source_folder = self.config.get('source_folder')
@@ -223,6 +256,7 @@ class BackupEventHandler(FileSystemEventHandler):
             debug_output=self.config.get('debug_output', False)
         )
         logging.info("✅ Backup process complete. Awaiting next change.")
+        logging.info('-' * 60, extra={'plain': True})
 
 # --- GUI Helper Classes ---
 
@@ -305,7 +339,7 @@ class BackupApp:
         self.log_queue = queue.Queue()
         self.queue_handler = QueueHandler(self.log_queue)
         # Create a specific formatter for the GUI log to ensure timestamps are included
-        gui_formatter = logging.Formatter(
+        gui_formatter = CustomFormatter(
             '[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
         )
         self.queue_handler.setFormatter(gui_formatter)
@@ -754,6 +788,12 @@ def run_console_mode(config_path):
     observer.join()
     logging.info("Watchdog stopped. Exiting.")
 
+def setup_plain_console_logging():
+    """Sets up the root logger to use the custom formatter for console output."""
+    root_logger = logging.getLogger()
+    # Replace the default handler's formatter with our custom one
+    root_logger.handlers[0].setFormatter(CustomFormatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+
 def main():
     """Parses arguments, loads config, and starts the file system observer."""
     # Print disclaimer to console on every launch
@@ -761,6 +801,8 @@ def main():
                   "This software is provided 'as-is'. Use at your own risk. "
                   "The author is not responsible for any damage or data loss.")
     print(f"\n{disclaimer}\n")
+
+    setup_plain_console_logging()
 
     parser = argparse.ArgumentParser(description="A tool to automatically back up a folder when its contents change.")
     parser.add_argument("config_file", help="Path to the JSON configuration file.")
